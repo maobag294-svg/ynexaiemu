@@ -1,0 +1,184 @@
+# YN.EXAI baseline: verify official Lemon source, scan provenance, build APK, publish evidence.
+# Self-contained single file. Put it at .github/workflows/build-lemon-baseline.yml in YOUR OWN repo, then Actions > Run workflow.
+name: build-lemon-baseline
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Lemon tag to build"
+        default: "v1.2.2"
+      expected_commit_prefix:
+        description: "Commit prefix the tag must resolve to (build aborts if different)"
+        default: "5f172bd0af"
+      gradle_task:
+        description: "Gradle task (from Lemon README)"
+        default: "assembleMainlineRelWithDebInfo"
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    env:
+      LEMON_URL: https://git.lemon-emu.org/lemon/Lemon-Project.git
+      MIRROR_URL: https://github.com/Ghael-V/Lemon-Project.git
+      EV: ${{ github.workspace }}/evidence
+      TAG: ${{ inputs.tag }}
+      PREFIX: ${{ inputs.expected_commit_prefix }}
+      TASK: ${{ inputs.gradle_task }}
+    steps:
+      - name: Prepare evidence dir and free disk space
+        shell: bash
+        run: |
+          mkdir -p "$EV"
+          { echo "image=${ImageOS:-?} ${ImageVersion:-?}"; echo "nproc=$(nproc)"; free -g | sed -n 2p; } | tee "$EV/runner.txt"
+          df -h / | tee "$EV/disk_before.txt"
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          df -h / | tee "$EV/disk_after_cleanup.txt"
+
+      - name: Clone source (official host first, GitHub mirror as fallback)
+        shell: bash
+        run: |
+          set -uo pipefail
+          OK=0
+          for URL in "$LEMON_URL" "$MIRROR_URL"; do
+            rm -rf src
+            echo "== cloning $URL" | tee -a "$EV/clone.log"
+            if git clone --recursive "$URL" src 2>&1 | tee -a "$EV/clone.log"; then
+              echo "clone_source=$URL" | tee "$EV/clone_source.txt"; OK=1; break
+            fi
+          done
+          [ "$OK" = 1 ] || { echo "both clones failed (see clone.log)"; exit 1; }
+          cd src
+          git fetch --tags --force 2>&1 | tail -2
+          git checkout --detach "tags/$TAG" || { echo "tag $TAG not found"; exit 1; }
+          git submodule update --init --recursive 2>&1 | tee -a "$EV/clone.log" || { echo "submodule update failed"; exit 1; }
+          git submodule status | tee "$EV/submodule_status.txt" || true
+
+      - name: Verify tag resolves to the expected commit (fails closed)
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$PREFIX" in ""|*[!0-9a-f]*) echo "PREFIX must be lowercase hex, got '$PREFIX'"; exit 2;; esac
+          [ "${#PREFIX}" -ge 7 ] || { echo "PREFIX too short (min 7 chars)"; exit 2; }
+          cd src
+          COMMIT="$(git rev-parse "refs/tags/$TAG^{commit}")"
+          HEAD_SHA="$(git rev-parse HEAD)"
+          {
+            echo "clone_source=$(cat "$EV/clone_source.txt" 2>/dev/null || echo ?)"
+            echo "tag=$TAG"; echo "tag_commit=$COMMIT"; echo "head=$HEAD_SHA"; echo "expected_prefix=$PREFIX"
+            echo "total_commits=$(git rev-list --count HEAD)"
+            echo "tag_signature:"; git verify-tag "$TAG" 2>&1 || echo "(tag not GPG-signed or key unknown)"
+          } | tee "$EV/commit_verification.txt"
+          case "$COMMIT" in
+            "$PREFIX"*) ;;
+            *) echo "MISMATCH: tag commit $COMMIT does not start with $PREFIX" | tee -a "$EV/commit_verification.txt"; exit 2 ;;
+          esac
+          [ "$HEAD_SHA" = "$COMMIT" ] || { echo "HEAD differs from tag commit" | tee -a "$EV/commit_verification.txt"; exit 2; }
+          echo "VERIFIED: $COMMIT" | tee -a "$EV/commit_verification.txt"
+
+      - name: Lineage vs Eden and Mali commit list (non-blocking)
+        continue-on-error: true
+        shell: bash
+        run: |
+          cd src
+          git remote add eden https://git.eden-emu.dev/eden-emu/eden 2>/dev/null || true
+          git fetch eden --no-tags 2>&1 | tail -3 | tee "$EV/eden_fetch.txt" || true
+          REF="$(git for-each-ref --format='%(refname)' refs/remotes/eden | grep -E '/(master|main)$' | head -1 || true)"
+          if [ -n "$REF" ]; then MB="$(git merge-base HEAD "$REF")"; { echo "eden_ref=$REF merge_base=$MB"; echo "lemon_only_commits=$(git rev-list --count "$MB"..HEAD)"; git diff --shortstat "$MB" HEAD; } | tee "$EV/lineage.txt"; else echo "eden unavailable" | tee "$EV/lineage.txt"; fi
+          git log --no-merges -i --grep=mali --grep=astc --grep=bcn --grep=panvk --pretty='%h %ad %s' --date=short | tee "$EV/mali_commits.txt" | head -60
+          git ls-files | grep -Ei 'astc|bcn|mali|recompress' | tee "$EV/mali_files.txt" | head -60
+
+      - name: Provenance and license scan
+        shell: bash
+        run: |
+          cd src
+          git ls-files | grep -Ei '(^|/)(LICENSE|COPYING|NOTICE|LICENSES/|\.reuse/)' > "$EV/license_files.txt" || true
+          git ls-files | grep -Ei '\.(so|a|jar|aar|apk|dll|exe|bin|zip|7z|dex|ttf|otf|dat)$' | while read -r f; do printf '%s  %s\n' "$(sha256sum "$f" | cut -d' ' -f1)" "$f"; done > "$EV/binary_sha256.txt" || true
+          git ls-files -z | xargs -0 file --mime-type 2>/dev/null | grep -Ev 'text/|inode/x-empty|image/(png|jpeg|svg)' > "$EV/non_text_files.txt" || true
+          [ -f cpmfile.json ] && cp cpmfile.json "$EV/cpmfile.json" || true
+          [ -f .ci/android/build.sh ] && head -120 .ci/android/build.sh > "$EV/ci_android_build_sh.txt" || true
+          grep -nE 'flavor|Flavor|ndkVersion|compileSdk|minSdk|targetSdk|abiFilters|cmake' src/android/app/build.gradle.kts > "$EV/gradle_build_facts.txt" 2>/dev/null || true
+          [ -f LICENSE.txt ] && head -3 LICENSE.txt > "$EV/license_head.txt" || true
+          {
+            echo "## spoof/benchmark"; grep -rIniE 'spoof|antutu|geekbench' --include='*.kt' --include='*.xml' --include='*.kts' --include='*.cpp' --include='*.h' --include='*.json' --include='*.yml' . | head -60 || true
+            echo "## endpoints"; grep -rIohE 'https?://[A-Za-z0-9./_?=&%-]+' --include='*.kt' --include='*.cpp' --include='*.h' --include='*.xml' . | sort | uniq -c | sort -rn | head -80 || true
+            echo "## online/telemetry"; grep -rIniE 'nextendo|telemetry|analytics|crashlytics|firebase' --include='*.kt' --include='*.cpp' --include='*.kts' --include='*.xml' . | head -60 || true
+            echo "## Lossless/LoadLibrary"; grep -rIniE 'Lossless\.dll|LoadLibrary' --include='*.kt' --include='*.cpp' . | head -30 || true
+            echo "## key material (expect none)"; git ls-files | grep -Ei 'prod\.keys|title\.keys|\.keys$|firmware' || echo none
+            echo "## bundled drivers"; git ls-files | grep -Ei 'lemon-?ade|adrenotools|driver' | head -40 || true
+            echo "## applicationId / flavors"; grep -rnE 'applicationId|productFlavors|create\("|applicationIdSuffix' android 2>/dev/null | head -40 || grep -rnE 'applicationId|applicationIdSuffix' src/android --include='*.kts' | head -40 || true
+          } > "$EV/redflags.txt"
+
+      - name: Host build tools (glslang for shader compilation, ninja)
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends glslang-tools ninja-build 2>&1 | tail -3 || echo "WARN apt install failed"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: android-actions/setup-android@v3
+
+      - name: Install the NDK/CMake the project declares
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd src/src/android
+          NDK_V="$(grep -hoP 'ndkVersion\s*=\s*"\K[^"]+' app/build.gradle.kts 2>/dev/null | head -1 || true)"
+          [ -n "$NDK_V" ] || NDK_V="$(grep -rhoP 'ndkVersion\s*=\s*"\K[^"]+' --include='*.kts' --include='*.gradle' . 2>/dev/null | head -1 || true)"
+          NDK_V="${NDK_V:-27.2.12479018}"
+          echo "ndk=$NDK_V" | tee "$EV/toolchain.txt"
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager "ndk;$NDK_V" "cmake;3.22.1" "platform-tools" 2>&1 | tail -5
+          echo "ANDROID_NDK_ROOT=$ANDROID_SDK_ROOT/ndk/$NDK_V" >> "$GITHUB_ENV"
+          java -version 2>&1 | tee -a "$EV/toolchain.txt"
+
+      - name: Build
+        shell: bash
+        run: |
+          set -o pipefail
+          cd src/src/android
+          chmod +x gradlew
+          ./gradlew --console=plain "$TASK" 2>&1 | tee "$EV/build.log"
+
+      - name: Hash APKs and summarize
+        if: success()
+        shell: bash
+        run: |
+          mkdir -p apk_out
+          find src/src/android -name '*.apk' -path '*outputs*' -exec cp {} apk_out/ \;
+          (cd apk_out && sha256sum *.apk | tee "$EV/apk_sha256.txt")
+          {
+            echo "### Baseline build succeeded"
+            echo '```'; cat "$EV/commit_verification.txt" | head -12; echo '```'
+            echo '```'; cat "$EV/apk_sha256.txt"; echo '```'
+            echo "Note: signed with a local/debug key, not Lemon's key; will not update an official Lemon install."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Collect failure diagnostics
+        if: failure()
+        shell: bash
+        run: |
+          tail -n 250 "$EV/build.log" > "$EV/build_tail.txt" 2>/dev/null || true
+          cd src/src/android 2>/dev/null || exit 0
+          find . \( -name CMakeError.log -o -name CMakeOutput.log -o -name 'build_output.txt' \) -size -2M 2>/dev/null | head -8 | while read -r f; do cp "$f" "$EV/diag_$(echo "$f" | tr '/' '_')"; done
+          find . -path '*/build/reports/*' -name '*.html' 2>/dev/null | head -3 | while read -r f; do cp "$f" "$EV/diag_$(echo "$f" | tr '/' '_')"; done
+          df -h / | tee "$EV/disk_at_failure.txt"
+
+      - name: Upload evidence (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evidence
+          path: evidence/
+          retention-days: 30
+      - name: Upload APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-baseline
+          path: apk_out/*.apk
+          retention-days: 14
